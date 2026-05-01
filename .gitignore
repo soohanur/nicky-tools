@@ -1,0 +1,42 @@
+# Environment & credentials
+.env
+.env.*
+!.env.example
+*.json
+!package.json
+!package-lock.json
+!tsconfig*.json
+
+# Chrome browser profiles (large & private)
+chrome_profiles/
+scraply/chrome_profile*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Logs & data output
+logs/
+*.log
+*.csv
+automation_data/
+output_*.csv
+
+# Node
+node_modules/
+
+# IDE & tools
+.vscode/
+.claude/
+.idea/
+
+# Build output
+dist/
+build/
+
+# Deploy scripts with credentials baked in
+vps_*.sh
