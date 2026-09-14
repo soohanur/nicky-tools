@@ -40,3 +40,7 @@ build/
 
 # Deploy scripts with credentials baked in
 vps_*.sh
+
+# Excel data (PII) & session state
+*.xlsx
+.session-restore/
