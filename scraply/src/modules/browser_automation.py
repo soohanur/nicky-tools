@@ -23,8 +23,12 @@ logger = setup_logger('browser')
 
 # Constants
 DEFAULT_IMPLICIT_WAIT = 5
-DEFAULT_PAGE_LOAD_TIMEOUT = 5
-DEFAULT_SCRIPT_TIMEOUT = 5
+# company.info pages are heavy; a 5s driver-level budget made navigation fail
+# ("timeout: Timed out receiving message from renderer") and killed the login,
+# which left whole runs empty. The searchers already wait for real content, so a
+# generous ceiling here costs nothing on a fast page.
+DEFAULT_PAGE_LOAD_TIMEOUT = 45
+DEFAULT_SCRIPT_TIMEOUT = 30
 DEFAULT_WAIT_TIMEOUT = 10
 REMOTE_DEBUGGING_PORT = 9222
 
