@@ -1,6 +1,7 @@
 """
 File upload and management routes
 """
+import logging
 import os
 import aiofiles
 from pathlib import Path
@@ -16,6 +17,8 @@ from ..db.models import Job
 from ..schemas.schemas import FileUploadResponse, FileListResponse
 from ..core.security import get_current_user
 from ..core.config import settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/files", tags=["Files"])
 
@@ -348,41 +351,51 @@ async def get_csv_headers(
             detail="File not found"
         )
     
+    file_ext = file_path.suffix.lower()
+    if file_ext not in ('.csv', '.xlsx', '.xlsm', '.xls'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported file type. Only CSV and Excel files are supported."
+        )
+
     try:
-        # Check file extension
-        file_ext = file_path.suffix.lower()
-        
+        # Detect the real header row (some exports carry a group-label row above
+        # it) so the dropdown lists the actual column names. The column mapping
+        # itself is NOT suggested: exports vary too much between deliveries and a
+        # wrong pre-fill is easy to miss, so the user picks every field by hand.
+        try:
+            from src.modules.kadaster_map import detect_any
+            det = detect_any(file_path)
+            headers = [h for h in det.get("headers", []) if h]
+            if headers:
+                return {
+                    "headers": headers,
+                    "sheet": det.get("sheet"),
+                    "header_row": det.get("header_row", 1),
+                    "file_type": det.get("file_type"),
+                    "detected": {},
+                }
+        except Exception as detect_err:
+            logger.warning(f"Header detection failed for {filename}: {detect_err}")
+
+        # Fallback: plain first-row read.
         if file_ext == '.csv':
-            # Read CSV headers with multiple encoding attempts
-            encodings = ['utf-8-sig', 'utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
-            for encoding in encodings:
+            for encoding in ['utf-8-sig', 'utf-8', 'latin-1', 'cp1252', 'iso-8859-1']:
                 try:
                     with open(file_path, 'r', encoding=encoding) as f:
-                        reader = csv.DictReader(f)
-                        headers = reader.fieldnames
-                        if headers:
-                            # Strip whitespace from headers to match CSVReader behavior
-                            cleaned_headers = [h.strip() for h in headers if h and h.strip()]
-                            return {"headers": cleaned_headers}
+                        names = csv.DictReader(f).fieldnames
+                        if names:
+                            return {"headers": [h.strip() for h in names if h and h.strip()],
+                                    "sheet": None, "header_row": 1,
+                                    "file_type": "csv", "detected": {}}
                 except UnicodeDecodeError:
                     continue
-            
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Could not decode CSV file"
-            )
-        
-        elif file_ext in ['.xlsx', '.xls']:
-            # Read Excel headers
-            df = pd.read_excel(file_path, nrows=0)
-            headers = df.columns.tolist()
-            return {"headers": headers}
-        
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Unsupported file type. Only CSV and Excel files are supported."
-            )
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Could not decode CSV file")
+
+        df = pd.read_excel(file_path, nrows=0)
+        return {"headers": df.columns.tolist(), "sheet": None, "header_row": 1,
+                "file_type": "excel", "detected": {}}
     
     except Exception as e:
         raise HTTPException(
