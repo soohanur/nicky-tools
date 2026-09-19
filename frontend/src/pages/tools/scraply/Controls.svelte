@@ -27,6 +27,9 @@
   
   // CSV Column Mapping
   let showColumnMapper = false;
+  let detectedMapping: { [key: string]: string } = {};
+  let detectedSheet: string | null = null;
+  let detectedHeaderRow = 1;
   let csvHeaders: string[] = [];
   let columnMappings: any = null;
   let tempUploadedFilename: string = '';
@@ -402,7 +405,7 @@
 
   async function uploadFileAndCreateJob() {
     if (!uploadedFile) {
-      error = 'Please select a CSV file';
+      error = 'Please select a CSV or Excel file';
       return null;
     }
 
@@ -430,13 +433,25 @@
 
       // Get CSV headers from uploaded file
       console.log('Getting CSV headers from:', uploadResult.filename);
-      const headers = await filesAPI.getCsvHeaders(uploadResult.filename);
-      console.log('CSV headers:', headers);
-      
+      const info = await filesAPI.getCsvHeaders(uploadResult.filename);
+      console.log('Header info:', info);
+
+      // The backend suggests a mapping; the modal shows it pre-filled and the
+      // user confirms or changes it before anything starts.
+      const d = info.detected || {};
+      detectedMapping = {
+        col_company: d.company || '',
+        col_street: d.street || '',
+        col_house_number: d.house_number || '',
+        col_city: d.city || ''
+      };
+      detectedSheet = info.sheet;
+      detectedHeaderRow = info.header_row || 1;
+
       // Store temporary data for column mapping
       tempUploadedFilename = uploadResult.filename;
       tempJobId = job.job_uuid;
-      csvHeaders = headers;
+      csvHeaders = info.headers;
       
       // Show column mapper modal
       showColumnMapper = true;
@@ -466,7 +481,9 @@
         // Update the job with column mappings
         await jobsAPI.updateJob(tempJobId, {
           config: {
-            ...columnMappings
+            ...columnMappings,
+            sheet: detectedSheet,
+            header_row: detectedHeaderRow
           }
         });
         
@@ -708,7 +725,9 @@
       link.href = url;
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
       const statusLabel = status === 'COMPLETED' ? 'complete' : 'partial';
-      link.setAttribute('download', `scraply_${statusLabel}_${completed}rows_${timestamp}.csv`);
+      // Results always come back as Excel, whatever was uploaded.
+      const outExt = '.xlsx';
+      link.setAttribute('download', `scraply_${statusLabel}_${completed}rows_${timestamp}${outExt}`);
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -885,7 +904,7 @@
           <input
             id="csv-upload"
             type="file"
-            accept=".csv"
+            accept=".csv,.xlsx,.xls"
             class="hidden"
             on:change={handleFileUpload}
             disabled={!canUpload}
@@ -894,7 +913,7 @@
             for="csv-upload"
             class="px-4 py-2 bg-white bg-opacity-80 border border-gray-300 text-sm font-medium text-gray-700 rounded-lg cursor-pointer hover:bg-gray-50 transition-colors"
           >
-            .csv
+            .csv / .xlsx
           </label>
         </div>
       </div>
@@ -971,6 +990,9 @@
 <CsvColumnMapperModal
   bind:show={showColumnMapper}
   columns={csvHeaders}
+  detected={detectedMapping}
+  sheet={detectedSheet}
+  headerRow={detectedHeaderRow}
   on:complete={handleColumnMappingComplete}
   on:cancel={handleColumnMappingCancel}
 />

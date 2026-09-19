@@ -2,6 +2,7 @@
 Celery background tasks for automation tools
 """
 import sys
+import os
 import time
 import signal
 import asyncio
@@ -332,8 +333,8 @@ def run_scraply_tool(
         ))
         
         # HARDCODED CREDENTIALS - Working solution
-        email = config.get('email') or 'Nvdm@sonsrealestate.nl'
-        password = config.get('password') or 'Geitjes1606@!'
+        email = config.get('email') or os.environ.get('COMPANYINFO_EMAIL', '')
+        password = config.get('password') or os.environ.get('COMPANYINFO_PASSWORD', '')
         headless = config.get('headless_mode', True)
         implicit_wait = config.get('implicit_wait', 5)
         page_load_timeout = config.get('page_load_timeout', 30)
@@ -353,6 +354,13 @@ def run_scraply_tool(
         
         # Ensure output directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Every upload goes through the same-file writer: the output is a COPY
+        # of what was uploaded with the contact columns appended, so sheets,
+        # rows and styling survive. The engine is the original CompanyInfo
+        # searcher.
+        return _run_legacy_tabular(self, job_uuid, input_path, output_path,
+                                   config, email, password)
         
         # Read input CSV
         logger.info(f"Reading input file: {input_path}")
@@ -804,6 +812,212 @@ def run_scraply_tool(
         # Reset termination flag for next task
         _termination_requested = False
 
+
+def _run_legacy_tabular(task, job_uuid: str, input_path, output_path,
+                        config: Dict[str, Any], email: str, password: str) -> Dict[str, Any]:
+    """
+    Run the original CompanyInfo searcher over a CSV or Excel upload and return
+    the SAME file with the contact columns appended.
+
+    The column mapping comes from the job config (what the user confirmed in the
+    mapping screen). Anything the user left blank falls back to auto-detection,
+    so a file still runs if the mapping step was skipped.
+    """
+    import random
+    from pathlib import Path as _Path
+
+    from src.modules.browser_automation import BrowserAutomation
+    from src.modules.companyinfo_searcher import CompanyInfoSearcher
+    from src.modules.kadaster_map import detect_any
+    from src.modules.tabular_io import TabularFile
+
+    OUT_COLS = ['NUMBER 1', 'NUMBER 2', 'NUMBER 3', 'NUMBER 4', 'NUMBER 5',
+                'EMAIL', 'BUSINESS_NAME', 'OWNER_NAME', 'NOTE']
+
+    # --- where the data is, and which columns to use -----------------------
+    try:
+        det = detect_any(input_path)
+    except Exception as e:
+        logger.warning(f"[LEGACY] detection failed ({e}); assuming header row 1")
+        det = {'sheet': None, 'header_row': 1, 'fields': {}, 'file_type': 'csv'}
+
+    sheet = config.get('sheet') or det.get('sheet')
+    header_row = int(config.get('header_row') or det.get('header_row') or 1)
+    f = det.get('fields', {})
+    col_company = config.get('col_company') or f.get('company', '')
+    col_prefix = config.get('col_name_prefix') or f.get('name_prefix', '')
+    col_street = config.get('col_street') or f.get('street', '')
+    col_house = config.get('col_house_number') or f.get('house_number', '')
+    col_city = config.get('col_city') or f.get('city', '')
+
+    logger.info(f"[LEGACY] sheet={sheet!r} header_row={header_row} "
+                f"company={col_company!r} street={col_street!r} "
+                f"house={col_house!r} city={col_city!r}")
+    run_async(task._add_job_log(
+        job_uuid, "INFO",
+        f"Using columns - name: '{col_company}', street: '{col_street}', "
+        f"house: '{col_house}', city: '{col_city}'"
+        + (f" (sheet '{sheet}', header row {header_row})" if sheet else "")))
+
+    tf = TabularFile(input_path, sheet=sheet, header_row=header_row)
+    rows = [r for r in tf.read_rows() if not TabularFile.is_blank(r)]
+    if not col_company and not col_street:
+        msg = ("Column mapping error: no name or street column was given and "
+               "none could be detected. Available columns: "
+               + ", ".join([h for h in tf.headers if h][:40]))
+        run_async(task._update_job_status(job_uuid, JobStatus.FAILED,
+                                          error_message=msg,
+                                          completed_at=datetime.utcnow()))
+        run_async(task._add_job_log(job_uuid, "ERROR", msg))
+        return {"error": msg}
+
+    total = len(rows)
+    run_async(task._update_job_status(job_uuid, JobStatus.RUNNING, total_rows=total,
+                                      processed_rows=0, successful_rows=0, failed_rows=0))
+    if total == 0:
+        run_async(task._update_job_status(job_uuid, JobStatus.COMPLETED, progress=100.0,
+                                          completed_at=datetime.utcnow()))
+        return {"total": 0, "success": 0, "failed": 0}
+
+    def _new_browser():
+        """Chrome can fail to start for a moment - retry before giving up."""
+        for attempt in (1, 2, 3):
+            try:
+                b = BrowserAutomation(profile_path=None, profile_name='SCRAPLY',
+                                      headless=True, implicit_wait=5)
+                b.__enter__()
+                se = CompanyInfoSearcher(browser=b, base_url='https://company.info',
+                                         timeout=int(config.get('page_load_timeout', 30)),
+                                         email=email, password=password)
+                return b, se
+            except Exception as e:
+                logger.error(f"[LEGACY] browser start failed ({attempt}/3): {e}")
+                time.sleep(15 * attempt)
+        return None, None
+
+    browser, searcher = _new_browser()
+    if not searcher:
+        msg = "Browser could not be started"
+        run_async(task._update_job_status(job_uuid, JobStatus.FAILED, error_message=msg,
+                                          completed_at=datetime.utcnow()))
+        return {"error": msg}
+
+    results: Dict[int, Dict[str, Any]] = {}
+    found = empty = 0
+    min_delay = float(config.get('min_delay', 1.0))
+    max_delay = float(config.get('max_delay', 3.0))
+    recycle_every = int(config.get('recycle_every', 40))
+    since_recycle = 0
+    cancelled = False
+
+    try:
+        for n, row in enumerate(rows, 1):
+            if _termination_requested or task._check_cancellation_sync(job_uuid):
+                cancelled = True
+                logger.warning(f"[LEGACY] cancelled at row {n}/{total}")
+                break
+            while task._check_paused_sync(job_uuid):
+                time.sleep(2)
+                if task._check_cancellation_sync(job_uuid):
+                    cancelled = True
+                    break
+            if cancelled:
+                break
+
+            get = lambda c: (row.get(c) or '').strip() if c else ''
+            name = f"{get(col_prefix)} {get(col_company)}".strip()
+            street, house, city = get(col_street), get(col_house), get(col_city)
+            if not name and not street:
+                results[row['row_index']] = {}
+                empty += 1
+                continue
+
+            if since_recycle >= recycle_every:
+                try:
+                    browser.__exit__(None, None, None)
+                except Exception:
+                    pass
+                time.sleep(2)
+                browser, searcher = _new_browser()
+                since_recycle = 0
+                if not searcher:
+                    break
+
+            try:
+                info = searcher.search_company(company_name=name, street=street,
+                                               house_number=house, city=city)
+            except Exception as e:
+                logger.error(f"[LEGACY] row {n} failed: {e}")
+                try:
+                    browser.__exit__(None, None, None)
+                except Exception:
+                    pass
+                time.sleep(3)
+                browser, searcher = _new_browser()
+                since_recycle = 0
+                if not searcher:
+                    break
+                try:
+                    info = searcher.search_company(company_name=name, street=street,
+                                                   house_number=house, city=city)
+                except Exception as e2:
+                    info = {'phones': [], 'email': '', 'business': '', 'owner': '',
+                            'note': f'ERROR: {str(e2)[:80]}'}
+
+            if info.get('skip'):
+                cols = {'NOTE': info.get('note') or 'SKIPPED: Too many businesses'}
+            else:
+                phones = info.get('phones') or []
+                cols = {f'NUMBER {i}': (phones[i - 1] if i <= len(phones) else '')
+                        for i in range(1, 6)}
+                cols['EMAIL'] = info.get('email') or ''
+                cols['BUSINESS_NAME'] = info.get('business') or ''
+                cols['OWNER_NAME'] = info.get('owner') or ''
+                cols['NOTE'] = info.get('note') or ''
+            results[row['row_index']] = cols
+            if cols.get('NUMBER 1') or cols.get('EMAIL'):
+                found += 1
+            else:
+                empty += 1
+            since_recycle += 1
+
+            run_async(task._update_job_status(
+                job_uuid, JobStatus.RUNNING,
+                progress=round(n / total * 100, 1),
+                processed_rows=n, successful_rows=found, failed_rows=empty))
+            if n % 25 == 0:
+                run_async(task._add_job_log(
+                    job_uuid, "INFO", f"Progress: {n}/{total} - {found} with contact"))
+            time.sleep(random.uniform(min_delay, max_delay))
+    finally:
+        try:
+            if browser is not None:
+                browser.__exit__(None, None, None)
+        except Exception:
+            pass
+
+    # Deliverables always go out as Excel, whatever was uploaded. A CSV result
+    # loses the leading zero on every 06... phone number and rounds 16-digit BAG
+    # ids the moment anyone opens it in Excel, which is where these files are
+    # read. An .xlsx upload still keeps its own sheets, styling and formats.
+    out = _Path(output_path).with_suffix('.xlsx')
+    filled = tf.write_output(out, OUT_COLS, results)
+    logger.info(f"[LEGACY] wrote {out} ({filled} rows populated)")
+
+    processed = found + empty
+    run_async(task._update_job_status(
+        job_uuid,
+        JobStatus.CANCELLED if cancelled else JobStatus.COMPLETED,
+        progress=round(processed / total * 100, 1) if cancelled else 100.0,
+        completed_at=datetime.utcnow(),
+        processed_rows=processed, successful_rows=found, failed_rows=empty,
+        output_file_path=str(out)))
+    run_async(task._add_job_log(
+        job_uuid, "INFO",
+        f"{'Cancelled' if cancelled else 'Completed'}: {found} with contact, "
+        f"{empty} without, of {processed} processed"))
+    return {"total": total, "success": found, "failed": empty,
+            "output_file": str(out), "cancelled": cancelled}
 
 def _process_parallel(
     task_instance,

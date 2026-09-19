@@ -61,9 +61,10 @@
       const url = window.URL.createObjectURL(blob);
       
       // Create enriched filename from display_filename
-      const originalName = job.display_filename || 'output.csv';
+      const originalName = job.display_filename || 'output.xlsx';
       const nameWithoutExt = originalName.replace(/\.[^/.]+$/, '');
-      const filename = `${nameWithoutExt}_enriched.csv`;
+      // Results always come back as Excel, whatever was uploaded.
+      const filename = `${nameWithoutExt}_enriched.xlsx`;
       
       const link = document.createElement('a');
       link.href = url;
@@ -134,9 +135,9 @@
   }
 
   function getOutputFilename(job: Job): string {
-    const originalName = job.display_filename || 'output.csv';
+    const originalName = job.display_filename || 'output.xlsx';
     const nameWithoutExt = originalName.replace(/\.[^/.]+$/, '');
-    return `${nameWithoutExt}_enriched.csv`;
+    return `${nameWithoutExt}_enriched.xlsx`;
   }
 
   function calculateFileSize(job: Job): number {
