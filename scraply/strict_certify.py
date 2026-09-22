@@ -44,6 +44,33 @@ GENERIC = {'beheer', 'holding', 'vastgoed', 'onroerend', 'goed', 'stichting',
            'handel', 'service', 'services', 'advies', 'kantoor', 'parochie'}
 
 
+LEGAL_FORMS = re.compile(
+    r'\b(b\.?\s?v\.?|n\.?\s?v\.?|v\.?\s?o\.?\s?f\.?|c\.?v\.?|u\.?a\.?|'
+    r'cooperatie|co[oö]peratie|stichting|vereniging|maatschappij|maatschap|'
+    r'kerkgenootschap|gemeente)\b', re.I)
+
+
+def is_legal_entity(owner: str) -> bool:
+    """
+    Does the deed name a registered legal person rather than a private person?
+
+    It matters because identity is established differently for the two. A
+    statutory name is unique in the KVK register, so an exact match IS the
+    identity. A surname is not unique, so a private person can only be placed
+    by co-location at their own address.
+    """
+    return bool(LEGAL_FORMS.search(owner or ''))
+
+
+def compare_key(name: str) -> str:
+    """Same-company test: punctuation-insensitive, word content exact."""
+    base = re.sub(r'\s*(b\.?\s?v\.?|n\.?\s?v\.?|v\.?o\.?f\.?|c\.?v\.?)\s*$',
+                  '', (name or '').strip().lower(), flags=re.I)
+    base = base.replace('.', '')
+    base = re.sub(r'[^\w\u00c0-\u00ff]+', ' ', base)
+    return ' '.join(base.split())
+
+
 def norm(s: str) -> str:
     s = unicodedata.normalize('NFKD', (s or '').lower())
     s = ''.join(c for c in s if not unicodedata.combining(c))
@@ -117,7 +144,8 @@ def main() -> int:
         limit = int(sys.argv[sys.argv.index('--limit') + 1])
 
     rows, hdr, raw = load_rows(src)
-    todo = [r for r in rows if r['num']]
+    todo = [r for r in rows
+            if r['num'] or is_legal_entity(r['owner'])]
     if limit:
         todo = todo[:limit]
     print(f"file: {src.name} | rows with a number: {len(todo)}")
@@ -166,10 +194,11 @@ def main() -> int:
             verdict, why, page_id = 'REJECT', 'no company found at the owner address', ''
 
             if not toks:
-                verdicts[r['row']] = ('REJECT', 'owner name has no distinctive token', '')
-                print(f"  REJECT row {r['row']:>4} {r['owner'][:26]:28}{r['num']:12} "
-                      f"owner name has no distinctive token")
-                continue
+                # No distinctive token, so the address path cannot run - but an
+                # exact statutory-name match still identifies the owner, which
+                # is how "Gmi Onroerend Goed B.V." and "EK-FH Beheer B.V." were
+                # lost: every word in them is filtered as generic or too short.
+                verdict, why, links = 'REJECT', 'owner name has no distinctive token', []
 
             for href in links:
                 d.get(href)
@@ -205,13 +234,116 @@ def main() -> int:
                     verdict, why = 'REJECT', 'owner named but delivered number is not on that page'
                 elif not addr_ok and pc:
                     verdict, why = 'REJECT', 'company is not at the owner postcode+house'
-            verdicts[r['row']] = (verdict, why, page_id)
-            print(f"  {verdict:9} row {r['row']:>4} {r['owner'][:26]:28}{r['num']:12}{why}"
+            # An owner that is itself a legal entity is identified by its
+            # statutory name, which is unique in the register - not by sitting
+            # at the address the deed lists, which is often a home or postal
+            # address. L. Wolterink B.V. is registered at Meester
+            # Nelissenstraat 57 while the deed says 55: same company, next
+            # door. Requiring the address there rejects the owner's own firm.
+            if verdict != 'CERTIFIED' and is_legal_entity(r['owner']):
+                d.get("https://company.info/organisations/search?query="
+                      + quote(r['owner']))
+                time.sleep(2.0)
+                cards = d.execute_script(
+                    "var skip=['-','omzet','werknemers','werknemers (kvk)','kvk'];"
+                    "return Array.from(document.querySelectorAll(\"li[data-cy='search-result']\"))"
+                    ".map(function(li){var a=li.querySelector('a');"
+                    "var n=a?(a.innerText||a.textContent||'').trim():'';"
+                    "n=n.split('\\n').map(function(x){return x.trim();})"
+                    ".filter(function(x){return x.length;})[0]||'';"
+                    "return {name:n, href:a?a.href:''};}).filter(function(x){return x.href;});") or []
+                target = compare_key(r['owner'])
+                exact = [c for c in cards if compare_key(c['name']) == target]
+                if len(exact) == 1:
+                    d.get(exact[0]['href'])
+                    time.sleep(2.2)
+                    text = d.execute_script("return document.body.innerText || ''") or ''
+                    tels = d.execute_script(
+                        "return Array.from(document.querySelectorAll('a[href^=\"tel:\"]'))"
+                        ".map(function(a){return a.getAttribute('href').replace('tel:','');});") or []
+                    phones = []
+                    for t in tels:
+                        # Work off the +31 marker rather than digit counting:
+                        # +31 900 8856 is only 9 digits once the prefix is gone,
+                        # so a length rule turns it into the nonsense 319008856.
+                        raw = (t or '').strip()
+                        body = re.sub(r'^(?:\+31|0031|31(?=\d{9,}))', '', raw)
+                        dd = ''.join(ch for ch in body if ch.isdigit())
+                        if dd and not dd.startswith('0'):
+                            dd = '0' + dd
+                        # A page with no contact details of its own still shows
+                        # company.info's OWN service number. Never a lead.
+                        if not dd or dd.endswith('202400400') or len(dd) < 8:
+                            continue
+                        if dd not in phones:
+                            phones.append(dd)
+                    kvk = re.search(r'KVK\s*\t?\s*(\d{8})', text)
+                    page_id = exact[0]['href'].split('?')[0].rsplit('/', 1)[-1]
+                    if not phones:
+                        verdict, why = 'REJECT', 'exact statutory name match, but no phone on that page'
+                    elif phones[0].startswith(('0900', '0800', '088', '085', '0906', '0909')):
+                        verdict, why = 'REVIEW', 'exact statutory name match, but a public service line'
+                        r['num'] = phones[0]
+                    else:
+                        verdict = 'CERTIFIED-NAME'
+                        why = (f"exact unique statutory name match"
+                               + (f", KVK {kvk.group(1)}" if kvk else '')
+                               + "; number taken from that page")
+                        r['num'] = phones[0]
+                        r['num2'] = phones[1] if len(phones) > 1 else ''
+                elif len(exact) > 1:
+                    # Duplicate legal names are common (5 x "Fides Holding
+                    # B.V."). Refusing outright throws away a real owner; the
+                    # postcode decides which of them it is.
+                    picked = None
+                    for cand in exact[:4]:
+                        d.get(cand['href'])
+                        time.sleep(2.2)
+                        ctext = d.execute_script("return document.body.innerText || ''") or ''
+                        cup = re.sub(r'\s+', '', ctext.upper())
+                        if pc and pc in cup:
+                            picked = (cand, ctext)
+                            break
+                    if picked:
+                        cand, ctext = picked
+                        tels = d.execute_script(
+                            "return Array.from(document.querySelectorAll('a[href^=\"tel:\"]'))"
+                            ".map(function(a){return a.getAttribute('href').replace('tel:','');});") or []
+                        phones = []
+                        for t in tels:
+                            body = re.sub(r'^(?:\+31|0031|31(?=\d{9,}))', '', (t or '').strip())
+                            dd = ''.join(ch for ch in body if ch.isdigit())
+                            if dd and not dd.startswith('0'):
+                                dd = '0' + dd
+                            if not dd or dd.endswith('202400400') or len(dd) < 8:
+                                continue
+                            if dd not in phones:
+                                phones.append(dd)
+                        kvk = re.search(r'KVK\s*\t?\s*(\d{8})', ctext)
+                        page_id = cand['href'].split('?')[0].rsplit('/', 1)[-1]
+                        if not phones:
+                            verdict, why = 'REJECT', (f'{len(exact)} same-named entities; the one at the '
+                                                      f'owner postcode has no phone')
+                        elif phones[0].startswith(('0900', '0800', '088', '085', '0906', '0909')):
+                            verdict, why = 'REVIEW', 'same-named entities; matched one is a service line'
+                            r['num'] = phones[0]
+                        else:
+                            verdict = 'CERTIFIED-NAME'
+                            why = (f'{len(exact)} entities share this name; the one at postcode {pc} '
+                                   + (f'(KVK {kvk.group(1)})' if kvk else '') + ' is the owner')
+                            r['num'] = phones[0]
+                            r['num2'] = phones[1] if len(phones) > 1 else ''
+                    else:
+                        verdict, why = 'REJECT', (f'{len(exact)} entities share this statutory name, '
+                                                  f'none at the owner postcode')
+
+            verdicts[r['row']] = (verdict, why, page_id, r['num'], r.get('num2', ''))
+            print(f"  {verdict:14} row {r['row']:>4} {r['owner'][:26]:28}{r['num']:12}{why[:52]}"
                   + (f"  [{page_id}]" if page_id else ''))
     finally:
         browser.__exit__(None, None, None)
 
-    n_ok = sum(1 for v in verdicts.values() if v[0] == 'CERTIFIED')
+    n_ok = sum(1 for v in verdicts.values() if v[0].startswith('CERTIFIED'))
     n_rev = sum(1 for v in verdicts.values() if v[0] == 'REVIEW')
     print(f"\nCERTIFIED {n_ok} | REVIEW {n_rev} | REJECT {len(verdicts)-n_ok-n_rev}")
 
@@ -237,11 +369,18 @@ def write_certified(src: Path, out_path: Path, verdicts: dict) -> None:
         v = verdicts.get(row)
         if not v:
             continue
-        verdict, why, page = v
+        verdict, why, page = v[0], v[1], v[2]
+        num = v[3] if len(v) > 3 else ''
+        num2 = v[4] if len(v) > 4 else ''
         ws.cell(row=row, column=col, value=verdict).number_format = '@'
         ws.cell(row=row, column=col + 1, value=why)
         ws.cell(row=row, column=col + 2, value=page or '').number_format = '@'
-        if verdict != 'CERTIFIED':
+        if verdict.startswith('CERTIFIED'):
+            if num and 'NUMBER 1' in idx:
+                c1 = ws.cell(row=row, column=idx['NUMBER 1']); c1.value = num; c1.number_format = '@'
+            if num2 and 'NUMBER 2' in idx:
+                c2 = ws.cell(row=row, column=idx['NUMBER 2']); c2.value = num2; c2.number_format = '@'
+        else:
             for name in ('NUMBER 1', 'NUMBER 2', 'EMAIL'):
                 if name in idx:
                     ws.cell(row=row, column=idx[name]).value = None

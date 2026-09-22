@@ -59,6 +59,14 @@ BASE = 'https://company.info'
 # They are handled as non-identifying words via GENERIC instead.
 LEGAL_SUFFIX = r'\s*(b\.?\s?v\.?|n\.?\s?v\.?|v\.?o\.?f\.?|c\.?v\.?)\s*$'
 
+# An owner that carries a legal form IS the registered entity, so its statutory
+# name identifies it outright. Without one, the owner is a natural person and
+# the name proves nothing on its own.
+LEGAL_FORM = re.compile(
+    r'\b(b\.?\s?v\.?|n\.?\s?v\.?|v\.?\s?o\.?\s?f\.?|c\.?\s?v\.?|u\.?\s?a\.?|'
+    r'co[o\u00f6]peratie|stichting|vereniging|maatschappij|maatschap|holding|'
+    r'kerkgenootschap|gemeente|parochie|diaconie)\b', re.I)
+
 # Dutch name particles - never identifying on their own.
 PARTICLES = {"van", "de", "den", "der", "het", "ter", "te", "aan", "in", "op",
              "'t", "d'", "du", "la", "le", "of", "and", "en"}
@@ -642,7 +650,16 @@ class VerifiedSearcher:
             return SearchOutcome.empty('ERROR', 'login failed')
 
         # ---------------- pass 1: exact company-name match ----------------
-        if lead_name:
+        # Only for owners that ARE a registered legal person. A statutory name
+        # is unique in the register, so an exact match is identity. A bare
+        # surname is not: "Schoemaker" matches a company literally called
+        # Schoemaker in Purmerend, 150km from a Doetinchem owner, and that is
+        # how nine private persons were handed a stranger's number. A private
+        # person can only be placed by co-location at their own address.
+        if lead_name and not LEGAL_FORM.search(lead_name):
+            notes.append('owner is a private person; identity needs the address, '
+                         'a surname alone is not a company name')
+        elif lead_name:
             try:
                 names = self._search(lead_name)
                 target = compare_key(lead_name)
