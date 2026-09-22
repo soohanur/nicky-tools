@@ -1,220 +1,134 @@
-"""
-Main FastAPI Application
-Scalable automation platform with job queue, real-time updates, and multi-tool support
-"""
+"""FastAPI app factory + lifespan. Wires routers, CORS and error handlers."""
+
+from __future__ import annotations
+
+import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-import time
-import logging
 
-from .core.config import settings
-from .db.database import init_db, close_db
-from .api import auth, jobs, files, system, websocket
+from app.auth.routes import router as auth_router
+from app.config import get_settings
+from app.core.db import close_db, init_db
+from app.core.logging import configure_logging, get_logger
+from app.domains.files.routes import router as files_router
+from app.domains.jobs.routes import router as jobs_router
+from app.domains.jobs.websocket import router as ws_router
+from app.domains.system.routes import router as system_router
+from app.health import router as health_router
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = get_logger("app")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Application lifespan events.
-    Startup: Initialize database
-    Shutdown: Clean up connections
-    """
-    # Startup
-    logger.info("Starting Automation Platform API...")
-    logger.info(f"Version: {settings.APP_VERSION}")
-    logger.info(f"Environment: {settings.ENVIRONMENT}")
-    logger.info(f"Debug Mode: {settings.DEBUG}")
-    
-    # Show environment URLs
-    if settings.DOMAIN_NAME:
-        logger.info(f"Domain: {settings.DOMAIN_NAME}")
-        logger.info(f"Backend URL: {settings.backend_url}")
-        logger.info(f"Frontend URL: {settings.frontend_url}")
-    else:
-        logger.info(f"Running on: http://{settings.HOST}:{settings.PORT}")
-    
-    # Initialize database
-    try:
-        await init_db()
-        logger.info("✓ Database initialized")
-    except Exception as e:
-        logger.error(f"✗ Database initialization failed: {e}")
-        raise
-    
-    # Check Redis connection
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    settings = get_settings()
+    configure_logging()
+    logger.info(
+        "Scraply API starting (env=%s, version=%s)", settings.ENVIRONMENT, settings.APP_VERSION
+    )
+
+    await init_db()
+    logger.info("database ready")
+
     try:
         from redis import Redis
-        redis_client = Redis.from_url(settings.REDIS_URL)
-        redis_client.ping()
-        logger.info("✓ Redis connection established")
-    except Exception as e:
-        logger.warning(f"⚠ Redis connection failed: {e}")
-    
-    # Check Celery workers
+
+        Redis.from_url(settings.REDIS_URL).ping()
+        logger.info("redis reachable")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("redis unreachable: %s", exc)
+
     try:
-        from .core.celery_app import celery_app
-        inspect = celery_app.control.inspect()
-        stats = inspect.stats()
-        if stats:
-            logger.info(f"✓ Celery workers active: {len(stats)}")
-        else:
-            logger.warning("⚠ No Celery workers found")
-    except Exception as e:
-        logger.warning(f"⚠ Celery check failed: {e}")
-    
-    logger.info(f"🚀 API Server ready")
-    logger.info(f"📚 API Docs: {settings.backend_url}/docs")
-    if settings.DOMAIN_NAME:
-        logger.info(f"🌐 Access at: {settings.backend_url}")
-    else:
-        logger.info(f"🌐 Local access: http://{settings.HOST}:{settings.PORT}")
-    
+        from app.core.task_queue import celery_app
+
+        stats = celery_app.control.inspect().stats()
+        logger.info("celery workers: %s", len(stats) if stats else 0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("celery check failed: %s", exc)
+
+    logger.info("docs at %s/docs", settings.backend_url)
     yield
-    
-    # Shutdown
-    logger.info("Shutting down Automation Platform API...")
+
     await close_db()
-    logger.info("✓ Cleanup complete")
+    logger.info("shutting down")
 
 
-# Create FastAPI app
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.APP_VERSION,
-    description="""
-    ## Scalable Automation Platform API
-    
-    **Multi-Tool Automation Backend** with job queue, real-time updates, and RESTful API.
-    
-    ### Features
-    - 🤖 **Multiple Automation Tools** (CompanyInfo scraper, extensible for more)
-    - 🔐 **JWT Authentication** (Secure user authentication)
-    - 📊 **Job Queue Management** (Celery-based background processing)
-    - 📡 **Real-time Updates** (WebSocket support for live progress)
-    - 📁 **File Management** (Upload/download CSV/Excel files)
-    - 📈 **System Monitoring** (Health checks and performance metrics)
-    - 🔄 **Retry Logic** (Automatic retry on failures)
-    - 📝 **Detailed Logging** (Track every step of execution)
-    
-    ### Current Tools
-    1. **CompanyInfo Scraper** - Extract contact information from CompanyInfo.com
-    
-    ### Future Tools (Architecture Ready)
-    - LinkedIn Profile Scraper
-    - Email Validator
-    - Phone Number Validator
-    - Business Data Enrichment
-    
-    ### Quick Start
-    1. Register: `POST /api/v1/auth/register`
-    2. Login: `POST /api/v1/auth/login` (get JWT token)
-    3. Create Job: `POST /api/v1/jobs`
-    4. Upload File: `POST /api/v1/files/upload`
-    5. Start Job: `POST /api/v1/jobs/{job_uuid}/start`
-    6. Monitor: `WebSocket /api/v1/ws` or `GET /api/v1/jobs/{job_uuid}`
-    7. Download: `GET /api/v1/files/download/{filename}`
-    """,
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url=f"{settings.API_PREFIX}/openapi.json",
-    lifespan=lifespan
-)
-
-# CORS middleware - Allow all origins for local development
-# Using JWT in Authorization header, not cookies, so credentials not needed
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=3600,
-)
-
-# Gzip compression
-app.add_middleware(GZipMiddleware, minimum_size=1000)
-
-
-# Request timing middleware
-@app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
-    """Add response time to headers."""
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    response.headers["X-Process-Time"] = str(process_time)
-    return response
-
-
-# Exception handlers
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Handle validation errors."""
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={
-            "detail": "Validation error",
-            "errors": exc.errors()
-        }
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(
+        title=settings.APP_NAME,
+        version=settings.APP_VERSION,
+        description="Scraply - company.info contact extraction. Jobs, files, live progress.",
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url=f"{settings.API_PREFIX}/openapi.json",
+        lifespan=lifespan,
     )
 
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    """Handle general exceptions."""
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
-    
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "detail": "Internal server error",
-            "error": str(exc) if settings.DEBUG else "An unexpected error occurred"
-        }
+    # JWT travels in the Authorization header (no cookies), so credentials stay off.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+        max_age=3600,
     )
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+    @app.middleware("http")
+    async def add_process_time_header(request: Request, call_next):  # type: ignore[no-untyped-def]
+        start = time.time()
+        response = await call_next(request)
+        response.headers["X-Process-Time"] = str(time.time() - start)
+        return response
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):  # type: ignore[no-untyped-def]
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"detail": "Validation error", "errors": exc.errors()},
+        )
+
+    @app.exception_handler(Exception)
+    async def general_exception_handler(request: Request, exc: Exception):  # type: ignore[no-untyped-def]
+        logger.error("Unhandled exception: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "detail": "Internal server error",
+                "error": str(exc) if settings.DEBUG else "An unexpected error occurred",
+            },
+        )
+
+    app.include_router(health_router)
+    app.include_router(auth_router, prefix=settings.API_PREFIX)
+    app.include_router(jobs_router, prefix=settings.API_PREFIX)
+    app.include_router(files_router, prefix=settings.API_PREFIX)
+    app.include_router(system_router, prefix=settings.API_PREFIX)
+    app.include_router(ws_router, prefix=settings.API_PREFIX)
+
+    @app.get("/")
+    async def root() -> dict:
+        return {
+            "name": settings.APP_NAME,
+            "version": settings.APP_VERSION,
+            "status": "running",
+            "docs": "/docs",
+            "health": f"{settings.API_PREFIX}/system/health",
+        }
+
+    if settings.DEBUG:
+        logger.warning("DEBUG MODE ENABLED - do not use in production")
+
+    return app
 
 
-# Include routers
-app.include_router(auth.router, prefix=settings.API_PREFIX)
-app.include_router(jobs.router, prefix=settings.API_PREFIX)
-app.include_router(files.router, prefix=settings.API_PREFIX)
-app.include_router(system.router, prefix=settings.API_PREFIX)
-app.include_router(websocket.router, prefix=settings.API_PREFIX)
-
-
-# Root endpoint
-@app.get("/")
-async def root():
-    """API root endpoint."""
-    return {
-        "name": settings.APP_NAME,
-        "version": settings.APP_VERSION,
-        "status": "running",
-        "docs": "/docs",
-        "health": f"{settings.API_PREFIX}/system/health"
-    }
-
-
-@app.get("/health")
-async def health():
-    """Quick health check."""
-    return {
-        "status": "healthy",
-        "version": settings.APP_VERSION
-    }
-
-
-# Development: Auto-reload notification
-if settings.DEBUG:
-    logger.warning("⚠️  DEBUG MODE ENABLED - Do not use in production!")
+app = create_app()

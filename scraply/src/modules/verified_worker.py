@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 BROWSER_RECYCLE_INTERVAL = 30      # rows per browser, lower than before: more pages/row
 MAX_CONSECUTIVE_ERRORS = 3
+BUILD_ATTEMPTS = 3                 # a browser start can fail transiently (low memory)
+BUILD_BACKOFF = 15                 # seconds, multiplied by the attempt number
 BLOCK_BACKOFF_BASE = 60            # seconds; doubles per consecutive block
 MAX_BLOCK_BACKOFF = 900
 
@@ -61,9 +63,19 @@ class ResultStore:
                     'empty': self.empty}
 
 
+# Call centres and paid service lines. They belong to a switchboard, never to
+# the owner of a parcel, so they are not leads however well attributed.
+SERVICE_PREFIXES = ('0900', '0800', '088', '085', '0906', '0909')
+
+
+def is_service_number(num: str) -> bool:
+    digits = ''.join(c for c in (num or '') if c.isdigit())
+    return digits.startswith(SERVICE_PREFIXES)
+
+
 def outcome_to_columns(outcome: Dict[str, Any]) -> Dict[str, str]:
     """Map a SearchOutcome onto the output columns. Empty means empty, never 'NULL'."""
-    phones = (outcome.get('phones') or [])[:2]
+    phones = [p for p in (outcome.get('phones') or []) if not is_service_number(p)][:2]
     return {
         'NUMBER 1': phones[0] if len(phones) > 0 else '',
         'NUMBER 2': phones[1] if len(phones) > 1 else '',
@@ -79,17 +91,23 @@ def _build(worker_id: int, email: str, password: str, max_candidates: int,
            min_delay: float, max_delay: float):
     from .browser_automation import BrowserAutomation
     from .verified_searcher import VerifiedSearcher
-    try:
-        browser = BrowserAutomation(profile_path=None, profile_name=f'V{worker_id}',
-                                    headless=True, implicit_wait=5)
-        browser.__enter__()
-        searcher = VerifiedSearcher(browser, email=email, password=password,
-                                    max_candidates=max_candidates,
-                                    min_delay=min_delay, max_delay=max_delay)
-        return browser, searcher
-    except Exception as e:
-        logger.error(f"worker {worker_id}: browser build failed - {e}")
-        return None, None
+    # Starting Chrome can fail for a moment (machine briefly out of memory).
+    # One failed start used to end the whole run, so retry before giving up.
+    for attempt in range(1, BUILD_ATTEMPTS + 1):
+        try:
+            browser = BrowserAutomation(profile_path=None, profile_name=f'V{worker_id}',
+                                        headless=True, implicit_wait=5)
+            browser.__enter__()
+            searcher = VerifiedSearcher(browser, email=email, password=password,
+                                        max_candidates=max_candidates,
+                                        min_delay=min_delay, max_delay=max_delay)
+            return browser, searcher
+        except Exception as e:
+            logger.error(f"worker {worker_id}: browser build failed "
+                         f"(attempt {attempt}/{BUILD_ATTEMPTS}) - {e}")
+            if attempt < BUILD_ATTEMPTS:
+                time.sleep(BUILD_BACKOFF * attempt)
+    return None, None
 
 
 def _close(browser, worker_id: int) -> None:
@@ -149,6 +167,20 @@ def process_rows(
                 browser, searcher = _build(worker_id, email, password,
                                            max_candidates, min_delay, max_delay)
                 if not searcher:
+                    # A failed rebuild used to end the run silently and leave the
+                    # rest of the file blank. Wait out whatever starved the
+                    # machine and keep trying before giving up.
+                    for wait in (30, 60, 120, 240):
+                        if cancel is not None and cancel.is_set():
+                            return {'worker_id': worker_id, 'status': 'cancelled'}
+                        logger.warning(f"worker {worker_id}: rebuild failed, retrying in {wait}s")
+                        time.sleep(wait)
+                        browser, searcher = _build(worker_id, email, password,
+                                                   max_candidates, min_delay, max_delay)
+                        if searcher:
+                            break
+                if not searcher:
+                    logger.error(f"worker {worker_id}: repeated rebuild failures, stopping")
                     break
                 since_recycle = 0
 

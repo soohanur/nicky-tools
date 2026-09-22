@@ -5,6 +5,7 @@
 *.json
 !package.json
 !package-lock.json
+!jsconfig.json
 !tsconfig*.json
 
 # Chrome browser profiles (large & private)
@@ -18,6 +19,8 @@ __pycache__/
 venv/
 .venv/
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
 
 # Logs & data output
 logs/
@@ -26,8 +29,11 @@ logs/
 automation_data/
 output_*.csv
 
-# Node
+# Node / Next.js
 node_modules/
+.next/
+out/
+next-env.d.ts
 
 # IDE & tools
 .vscode/

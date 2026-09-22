@@ -1,29 +1,24 @@
 {
-  "name": "frontend",
+  "name": "scraply",
   "private": true,
-  "version": "0.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json"
-  },
-  "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^6.2.1",
-    "@tailwindcss/postcss": "^4.1.18",
-    "@tsconfig/svelte": "^5.0.6",
-    "@types/node": "^24.10.1",
-    "autoprefixer": "^10.4.24",
-    "postcss": "^8.5.6",
-    "svelte": "^5.43.8",
-    "svelte-check": "^4.3.4",
-    "tailwindcss": "^4.1.18",
-    "typescript": "~5.9.3",
-    "vite": "^7.2.4"
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint ."
   },
   "dependencies": {
-    "axios": "^1.13.4",
-    "svelte-spa-router": "^4.0.1"
+    "next": "^16.3.5",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.5.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^16.3.5",
+    "postcss": "^8.5.15",
+    "tailwindcss": "^3.4.19"
   }
 }

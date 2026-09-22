@@ -1,85 +1,41 @@
-# Automation Platform - Scraply & More
+# Scraply
 
-## Overview
-Professional automation platform featuring **Scraply** - an automated CompanyInfo.com data scraper, with architecture ready for additional tools.
+Contact extraction from company.info. Upload a CSV or Excel file of companies,
+map four columns, press Start; Scraply scrapes phone numbers and emails in
+headless Chrome and hands back an enriched Excel file. Login and registration
+(admin-key gated) go straight to the dashboard.
 
-### 🚀 Current Tools
-- **Scraply** (v2.0) - CompanyInfo data extraction with phone and email discovery
+Live: https://nicky.tools
 
-### 🔮 Future Tools (Coming Soon)
-- LinkedIn Profile Scraper
-- Email Validator
-- Phone Number Validator
-- Data Enrichment Tool
-
-## 📁 Project Structure (Tool-Isolated Architecture)
-
+## Layout
 ```
-Data Info/                          # Project root
-│
-├── 📂 scraply/                     # ⭐ Scraply Tool (CompanyInfo Scraper)
-│   ├── config.py                   # Scraply configuration
-│   ├── main.py                     # Scraply entry point
-│   ├── csv_files/                  # ⭐ Scraply CSV files (isolated)
-│   │   ├── input/                  # 📥 Drop CSV files here
-│   │   └── output/                 # 📤 Get results here
-│   ├── chrome_profiles/            # ⭐ Scraply browser profiles
-│   │   ├── default/                # Default Chrome profile
-│   │   └── data_profile/           # Alternative profile
-│   ├── logs/                       # ⭐ Scraply logs
-│   │   └── scraply.log
-│   └── src/                        # Scraply source modules
-│
-├── 📂 backend/                     # FastAPI REST API & Job Queue
-│   ├── app/                        # Application code
-│   │   ├── api/                    # API endpoints
-│   │   ├── core/                   # Config, security, celery
-│   │   ├── db/                     # Database models
-│   │   ├── schemas/                # Pydantic schemas
-│   │   └── tasks/                  # Background tasks (supports all tools)
-│   ├── docker-compose.yml          # Multi-container deployment
-│   ├── Dockerfile                  # Container image
-│   └── requirements.txt            # Python dependencies
-│
-├── 📂 automation_data/             # Backend runtime storage
-│   ├── input/                      # Backend API uploads
-│   ├── output/                     # Backend API results
-│   └── logs/                       # Backend logs
-│
-├── 📂 docs/                        # Documentation
-│   ├── DEPLOYMENT_GUIDE.md         # Hostinger deployment
-│   ├── KVM2_ARCHITECTURE.md        # VPS architecture
-│   └── *.md                        # Additional guides
-│
-└── 📂 logs/                        # Global application logs
+scraply/
+  frontend/     Next.js 16 dashboard, static export served by nginx   -> frontend/README.md
+  backend/      FastAPI API + Celery worker, organised by domain      -> backend/README.md
+  scraply/      the scraper engine (Selenium) + CLI runners. Do not restructure.
+  docs/         runbooks, architecture notes, older deployment guides
+  prototype/    the HTML/CSS prototype the UI is built from
+  deploy.sh     VPS deploy (systemd + nginx)      docker-compose.yml   local full stack
+  .github/workflows/deploy-vps.yml   push to main -> ./deploy.sh on the VPS
 ```
 
-### 🎯 Architecture Benefits
+## Run locally
+```bash
+docker compose up -d db redis                 # Postgres + Redis
+cd backend && cp .env.example .env && make install && make db-upgrade && make run
+cd backend && make worker                     # scraper worker (needs Chrome + chromedriver)
+cd frontend && cp .env.example .env.local && npm install && npm run dev   # http://localhost:3000
+```
+Or the whole stack in containers: `cp .env.example .env && docker compose up --build`.
 
-✅ **Tool Isolation**: Each tool has its own CSV, profiles, and logs  
-✅ **No Conflicts**: Future tools won't interfere with Scraply  
-✅ **Easy Addition**: Add new tools with same pattern  
-✅ **Clean Structure**: Everything organized by tool  
-✅ **Scalable**: Supports unlimited tools  
+## Deploy
+The VPS runs `datainfo-api` (uvicorn) and `datainfo-celery` (Celery, prefork,
+one Chrome per worker process) under systemd; nginx serves `frontend/out` and
+proxies `/api/` to the API. `./deploy.sh` does the whole thing; `./deploy.sh --quick`
+just restarts the services after a code pull.
 
-## Features
-- Excel data reading and writing
-- Browser automation with existing session
-- CompanyInfo search by company name and address
-- Google fallback search
-- Scalable modular architecture
-
-## Setup
-1. Install Python 3.8+
-2. Install dependencies: `pip install -r requirements.txt`
-3. Configure browser profile path in config
-4. Place input Excel file in data/input/
-5. Run: `python src/main.py`
-
-## Workflow
-- Step 0: Read Excel row data (Company Name, Address)
-- Step 1: Search CompanyInfo by company name
-- Step 2: Search by address if no results
-- Step 3: Google fallback if needed
-- Step 4: Extract phone (prefer 06, fallback 05) and email
-- Step 5: Write results back to Excel
+## Checks
+```bash
+cd backend && make check          # ruff + pytest (SQLite in memory, no services)
+cd frontend && npm run lint && npm run build
+```

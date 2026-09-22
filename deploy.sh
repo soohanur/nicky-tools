@@ -1,149 +1,78 @@
 #!/bin/bash
-################################################################################
-# Deployment Script for Automation Platform
-# Run this script after vps_setup.sh and transferring project files
-################################################################################
+# Deploy Scraply on the VPS (systemd + nginx, no Docker).
+# Run from the checkout root on the server, e.g. /var/www/datainfo. Idempotent.
+#
+#   ./deploy.sh              # full: deps, migrations, frontend build, services, nginx
+#   ./deploy.sh --quick      # code already pulled: restart API + worker only
+#
+# Expects backend/.env (see backend/.env.example). Service names stay
+# datainfo-api / datainfo-celery so existing monitoring keeps working.
+set -euo pipefail
 
-set -e  # Exit on error
-
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-print_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
-print_success() { echo -e "${GREEN}✅ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
-print_error() { echo -e "${RED}❌ $1${NC}"; }
-
-echo "=================================="
-echo "🚀 Deployment Script"
-echo "=================================="
-echo ""
-
-# Get project directory
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+API_SERVICE=datainfo-api
+WORKER_SERVICE=datainfo-celery
+SITE_NAME=scraply
+RUN_USER="${RUN_USER:-$USER}"
+DOMAIN="${DOMAIN_NAME:-}"
+
+info() { echo -e "\033[0;34m>\033[0m $1"; }
+ok() { echo -e "\033[0;32mok\033[0m $1"; }
+
 cd "$PROJECT_DIR"
 
-print_info "Project directory: $PROJECT_DIR"
-echo ""
-
-# Check if .env exists
-if [ ! -f ".env" ]; then
-    print_warning ".env file not found!"
-    if [ -f ".env.production" ]; then
-        print_info "Copying .env.production to .env"
-        cp .env.production .env
-        print_error "⚠️  IMPORTANT: Edit .env file and update:"
-        echo "   - DOMAIN_NAME"
-        echo "   - SECRET_KEY"
-        echo "   - POSTGRES_PASSWORD"
-        echo "   - COMPANYINFO_EMAIL"
-        echo "   - COMPANYINFO_PASSWORD"
-        echo ""
-        read -p "Press Enter after editing .env file..."
-    else
-        print_error ".env.production not found. Please create .env file first."
-        exit 1
-    fi
+if [ "${1:-}" = "--quick" ]; then
+    sudo systemctl restart "$API_SERVICE" "$WORKER_SERVICE"
+    sleep 5
+    systemctl is-active "$API_SERVICE" "$WORKER_SERVICE"
+    exit 0
 fi
 
-# Load environment variables
-source .env
+[ -f backend/.env ] || { echo "backend/.env missing (copy backend/.env.example)"; exit 1; }
+# shellcheck disable=SC1091
+set -a; source backend/.env; set +a
+DOMAIN="${DOMAIN:-${DOMAIN_NAME:-}}"
+[ -n "$DOMAIN" ] || { echo "DOMAIN_NAME not set in backend/.env"; exit 1; }
 
-# Validate required variables
-print_info "Validating environment variables..."
-REQUIRED_VARS=("DOMAIN_NAME" "SECRET_KEY" "POSTGRES_PASSWORD" "COMPANYINFO_EMAIL" "COMPANYINFO_PASSWORD")
-for var in "${REQUIRED_VARS[@]}"; do
-    if [ -z "${!var}" ]; then
-        print_error "Required variable $var is not set in .env"
-        exit 1
-    fi
-done
-print_success "Environment variables validated"
+info "backend dependencies"
+cd backend
+[ -d venv ] || python3 -m venv venv
+./venv/bin/pip install -q --upgrade pip
+./venv/bin/pip install -q -r requirements.txt
+ok "python deps"
 
-# Setup PostgreSQL database
-print_info "Step 1/8: Setting up PostgreSQL database..."
-sudo -u postgres psql <<EOF
--- Drop database if exists (for fresh install)
-DROP DATABASE IF EXISTS ${POSTGRES_DB};
-CREATE DATABASE ${POSTGRES_DB};
+info "database migrations"
+./venv/bin/alembic upgrade head
+ok "alembic"
+cd "$PROJECT_DIR"
 
--- Drop user if exists
-DROP USER IF EXISTS ${POSTGRES_USER};
-CREATE USER ${POSTGRES_USER} WITH ENCRYPTED PASSWORD '${POSTGRES_PASSWORD}';
-GRANT ALL PRIVILEGES ON DATABASE ${POSTGRES_DB} TO ${POSTGRES_USER};
+info "directories"
+mkdir -p logs chrome_profiles scraply/csv_files/input scraply/csv_files/output
+ok "directories"
 
--- Grant schema permissions
-\c ${POSTGRES_DB}
-GRANT ALL ON SCHEMA public TO ${POSTGRES_USER};
-EOF
-print_success "Database created: ${POSTGRES_DB}"
+info "frontend build (static export)"
+cd frontend
+# Same origin in production: nginx proxies /api/ to the API, so the URL stays empty.
+NEXT_PUBLIC_API_URL="" npm ci --no-audit --no-fund
+NEXT_PUBLIC_API_URL="" npm run build
+ok "frontend/out"
+cd "$PROJECT_DIR"
 
-# Install backend dependencies
-print_info "Step 2/8: Installing backend dependencies..."
-cd "$PROJECT_DIR/backend"
-
-# Create virtual environment
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
-fi
-
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-print_success "Backend dependencies installed"
-
-# Run database migrations
-print_info "Step 3/8: Running database migrations..."
-alembic upgrade head
-print_success "Database migrations completed"
-
-# Create necessary directories
-print_info "Step 4/8: Creating directories..."
-mkdir -p "$PROJECT_DIR/logs"
-mkdir -p "$PROJECT_DIR/automation_data"
-mkdir -p "$PROJECT_DIR/chrome_profiles"
-mkdir -p "$PROJECT_DIR/scraply/csv_files/input"
-mkdir -p "$PROJECT_DIR/scraply/csv_files/output"
-chmod -R 755 "$PROJECT_DIR/logs"
-chmod -R 755 "$PROJECT_DIR/automation_data"
-print_success "Directories created"
-
-# Install frontend dependencies and build
-print_info "Step 5/8: Building frontend..."
-cd "$PROJECT_DIR/frontend"
-
-# Create frontend .env file
-if [ ! -f ".env.production.local" ]; then
-    cp .env.production .env.production.local
-    # Update with domain from backend .env
-    sed -i "s|https://your-domain.com|https://${DOMAIN_NAME}|g" .env.production.local
-fi
-
-npm install
-npm run build
-print_success "Frontend built successfully"
-
-# Setup systemd services
-print_info "Step 6/8: Creating systemd services..."
-
-# Backend service
-sudo tee /etc/systemd/system/automation-backend.service > /dev/null <<EOF
+info "systemd units"
+sudo tee /etc/systemd/system/$API_SERVICE.service > /dev/null <<EOF
 [Unit]
-Description=Automation Platform Backend API
+Description=Scraply API (FastAPI)
 After=network.target postgresql.service redis.service
 
 [Service]
 Type=simple
-User=$USER
-Group=$USER
+User=$RUN_USER
+Group=$RUN_USER
 WorkingDirectory=$PROJECT_DIR/backend
 Environment="PATH=$PROJECT_DIR/backend/venv/bin"
-EnvironmentFile=$PROJECT_DIR/.env
-ExecStart=$PROJECT_DIR/backend/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+Environment="PYTHONPATH=$PROJECT_DIR/backend:$PROJECT_DIR/scraply"
+EnvironmentFile=$PROJECT_DIR/backend/.env
+ExecStart=$PROJECT_DIR/backend/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2
 Restart=always
 RestartSec=10
 
@@ -151,36 +80,36 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-# Celery service
-sudo tee /etc/systemd/system/automation-celery.service > /dev/null <<EOF
+sudo tee /etc/systemd/system/$WORKER_SERVICE.service > /dev/null <<EOF
 [Unit]
-Description=Automation Platform Celery Worker
+Description=Scraply scraper worker (Celery)
 After=network.target redis.service postgresql.service
 
 [Service]
 Type=simple
-User=$USER
-Group=$USER
+User=$RUN_USER
+Group=$RUN_USER
 WorkingDirectory=$PROJECT_DIR/backend
-Environment="PATH=$PROJECT_DIR/backend/venv/bin"
-EnvironmentFile=$PROJECT_DIR/.env
-ExecStart=$PROJECT_DIR/backend/venv/bin/celery -A app.core.celery_app worker --loglevel=info --concurrency=2
+Environment="PATH=$PROJECT_DIR/backend/venv/bin:/usr/local/bin:/usr/bin"
+Environment="PYTHONPATH=$PROJECT_DIR/backend:$PROJECT_DIR/scraply"
+EnvironmentFile=$PROJECT_DIR/backend/.env
+ExecStart=/bin/bash $PROJECT_DIR/backend/scripts/start_celery.sh
 Restart=always
 RestartSec=10
+KillMode=mixed
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
 EOF
+chmod +x backend/scripts/start_celery.sh
+ok "units written"
 
-print_success "Systemd services created"
-
-# Configure Nginx
-print_info "Step 7/8: Configuring Nginx..."
-
-sudo tee /etc/nginx/sites-available/automation > /dev/null <<EOF
+info "nginx"
+sudo tee /etc/nginx/sites-available/$SITE_NAME > /dev/null <<EOF
 server {
     listen 80;
-    server_name ${DOMAIN_NAME};
+    server_name $DOMAIN;
 
     client_max_body_size 100M;
     proxy_connect_timeout 600;
@@ -188,21 +117,8 @@ server {
     proxy_read_timeout 600;
     send_timeout 600;
 
-    # API Backend
-    location /api/ {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    # WebSocket
-    location /api/v1/ws/ {
+    # WebSocket (live job updates)
+    location /api/v1/ws {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
@@ -212,101 +128,46 @@ server {
         proxy_read_timeout 86400;
     }
 
-    # API Docs
-    location ~ ^/(docs|redoc|openapi.json) {
+    # API
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location ~ ^/(docs|redoc|healthz|readyz)$ {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host \$host;
     }
 
-    # Frontend
-    location / {
-        root $PROJECT_DIR/frontend/dist;
-        try_files \$uri \$uri/ /index.html;
-    }
+    # Frontend: Next.js static export (trailing-slash routes -> <dir>/index.html)
+    root $PROJECT_DIR/frontend/out;
+    index index.html;
 
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
-        root $PROJECT_DIR/frontend/dist;
+    location /_next/static/ {
         expires 1y;
         add_header Cache-Control "public, immutable";
     }
+
+    location / {
+        try_files \$uri \$uri/ \$uri.html /404.html;
+    }
 }
 EOF
-
-# Enable site
-sudo ln -sf /etc/nginx/sites-available/automation /etc/nginx/sites-enabled/
-sudo rm -f /etc/nginx/sites-enabled/default
-
-# Test Nginx config
+sudo ln -sf /etc/nginx/sites-available/$SITE_NAME /etc/nginx/sites-enabled/$SITE_NAME
+sudo rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/automation
 sudo nginx -t
 sudo systemctl reload nginx
-print_success "Nginx configured"
+ok "nginx"
 
-# Start services
-print_info "Step 8/8: Starting services..."
+info "services"
 sudo systemctl daemon-reload
-sudo systemctl enable automation-backend automation-celery
-sudo systemctl restart automation-backend
-sudo systemctl restart automation-celery
-
-# Wait for services to start
-sleep 3
-
-# Check service status
-if systemctl is-active --quiet automation-backend; then
-    print_success "Backend service started"
-else
-    print_error "Backend service failed to start"
-    sudo journalctl -u automation-backend -n 20
-fi
-
-if systemctl is-active --quiet automation-celery; then
-    print_success "Celery service started"
-else
-    print_error "Celery service failed to start"
-    sudo journalctl -u automation-celery -n 20
-fi
-
-echo ""
-print_success "✨ Deployment completed!"
-echo ""
-
-# Print access information
-echo "=================================="
-echo "📋 Access Information"
-echo "=================================="
-echo "Frontend:  http://${DOMAIN_NAME}"
-echo "API Docs:  http://${DOMAIN_NAME}/docs"
-echo "API:       http://${DOMAIN_NAME}/api/v1"
-echo ""
-
-# SSL setup prompt
-echo "=================================="
-echo "🔒 SSL Setup (Optional)"
-echo "=================================="
-echo "To enable HTTPS, run:"
-echo "sudo certbot --nginx -d ${DOMAIN_NAME}"
-echo ""
-echo "After SSL setup:"
-echo "1. Update .env: USE_HTTPS=True"
-echo "2. Update frontend/.env.production.local: VITE_API_BASE_URL=https://${DOMAIN_NAME}"
-echo "3. Rebuild frontend: cd frontend && npm run build"
-echo "4. Restart services: sudo systemctl restart automation-backend"
-echo ""
-
-# Print monitoring commands
-echo "=================================="
-echo "📊 Monitoring Commands"
-echo "=================================="
-echo "Check services:"
-echo "  sudo systemctl status automation-backend"
-echo "  sudo systemctl status automation-celery"
-echo ""
-echo "View logs:"
-echo "  sudo journalctl -u automation-backend -f"
-echo "  sudo journalctl -u automation-celery -f"
-echo ""
-echo "Restart services:"
-echo "  sudo systemctl restart automation-backend"
-echo "  sudo systemctl restart automation-celery"
-echo ""
-echo "=================================="
+sudo systemctl enable "$API_SERVICE" "$WORKER_SERVICE" > /dev/null
+sudo systemctl restart "$API_SERVICE" "$WORKER_SERVICE"
+sleep 5
+systemctl is-active "$API_SERVICE" "$WORKER_SERVICE"
+curl -fsS "http://127.0.0.1:8000/healthz" && echo
+ok "deployed: http://$DOMAIN  (run: sudo certbot --nginx -d $DOMAIN for TLS, then USE_HTTPS=True in backend/.env)"

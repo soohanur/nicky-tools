@@ -340,12 +340,28 @@ class VerifiedSearcher:
     # between runs - the same query matched once and missed the next time.
     # innerText read through JS is layout-independent, and one call for the
     # whole list is far cheaper than N round-trips.
+    # The card renders its chrome ("Omzet", "Werknemers (KVK)", "-") before the
+    # company name arrives. Taking the first non-empty line therefore returned
+    # "-" for a row that had not hydrated, which then matched no target and was
+    # recorded as "1 results, 0 exact" on companies that are an exact match.
+    # The name lives in the row's own link, so read that first.
+    _PLACEHOLDERS = ("-", "omzet", "werknemers", "werknemers (kvk)", "kvk",
+                     "resultaten", "laden", "loading")
     _RESULT_NAMES_JS = """
+        var skip = ["-", "omzet", "werknemers", "werknemers (kvk)", "kvk",
+                    "resultaten", "laden", "loading"];
         return Array.from(document.querySelectorAll("li[data-cy='search-result']"))
             .map(function (li) {
+                var a = li.querySelector('a');
+                var fromLink = a ? (a.innerText || a.textContent || '').trim() : '';
+                fromLink = fromLink.split('\\n').map(function (s) { return s.trim(); })
+                                   .filter(function (s) { return s.length; })[0] || '';
+                if (fromLink && skip.indexOf(fromLink.toLowerCase()) < 0) return fromLink;
                 var t = li.innerText || li.textContent || '';
-                return t.split('\\n').map(function (s) { return s.trim(); })
-                        .filter(function (s) { return s.length; })[0] || '';
+                var lines = t.split('\\n').map(function (s) { return s.trim(); })
+                             .filter(function (s) { return s.length
+                                       && skip.indexOf(s.toLowerCase()) < 0; });
+                return lines[0] || '';
             });
     """
 
@@ -426,11 +442,16 @@ class VerifiedSearcher:
         'no results' before reading.
         """
         url = f'{BASE}/organisations/search?query={quote(query)}'
+        # "has some text" is not ready: the skeleton row already carries "-" and
+        # "Omzet". Wait for a row whose LINK has a real name in it.
         ready_js = (
+            "var skip = ['-','omzet','werknemers','werknemers (kvk)','kvk',"
+            "            'resultaten','laden','loading'];"
             "var li = document.querySelectorAll(\"li[data-cy='search-result']\");"
             "for (var i = 0; i < li.length; i++) {"
-            "  var s = (li[i].innerText || li[i].textContent || '').trim();"
-            "  if (s.length) return true; }"
+            "  var a = li[i].querySelector('a');"
+            "  var s = a ? (a.innerText || a.textContent || '').trim() : '';"
+            "  if (s.length > 1 && skip.indexOf(s.toLowerCase()) < 0) return true; }"
             "var b = ((document.body && document.body.textContent) || '').toLowerCase();"
             "return b.indexOf('geen resultaten') >= 0 || b.indexOf('0 resultaten') >= 0;")
 
@@ -445,7 +466,9 @@ class VerifiedSearcher:
             # not hydrated. `['']` is truthy, so an earlier version returned it
             # as "1 result" whose name matched nothing - that alone cost seven
             # rows in a full run ("1 results, 0 exact" on obvious companies).
-            if any(n.strip() for n in names):
+            real = [n for n in names
+                    if n.strip() and n.strip().lower() not in self._PLACEHOLDERS]
+            if real:
                 return names
             # An empty list is only trustworthy when the page SAYS there are no
             # results. Otherwise the app simply had not rendered, and returning
@@ -577,6 +600,22 @@ class VerifiedSearcher:
         """
         lead_name = (lead_name or '').strip()
         strong, short, given = name_tokens(lead_name, first_names)
+
+        # Strip place names out of the proof tokens. Every company page in a
+        # town carries that town's name, so an owner called "... DOETINCHEM BV"
+        # would otherwise be "proved" against any company in Doetinchem - which
+        # is exactly how row 71 of the achterhoek export got a stranger's number.
+        places = {w.lower() for w in _split(city or '')}
+        for extra in (alt_addresses or []):
+            places |= {w.lower() for w in _split(extra[2] or '')}
+        if places:
+            kept = [t for t in strong if t not in places]
+            dropped = [t for t in strong if t in places]
+            if dropped:
+                logger.debug(f"ignoring place-name token(s) {dropped} for '{lead_name}'")
+            strong = kept
+            short = [t for t in short if t not in places]
+
         notes: List[str] = []
 
         if not self.ensure_login():

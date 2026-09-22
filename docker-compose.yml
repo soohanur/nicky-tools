@@ -1,0 +1,111 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: scraply-backend
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-automation_user}:${POSTGRES_PASSWORD:-change-me-in-prod}@db/${POSTGRES_DB:-automation_db}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      PYTHONPATH: /app:/app/scraply
+    volumes:
+      - ./backend/app:/app/app
+      - ./scraply:/app/scraply
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - scraply
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: scraply-worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-automation_user}:${POSTGRES_PASSWORD:-change-me-in-prod}@db/${POSTGRES_DB:-automation_db}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      PYTHONPATH: /app:/app/scraply
+      HEADLESS_MODE: "True"
+    volumes:
+      - ./backend/app:/app/app
+      - ./scraply:/app/scraply
+      - ./chrome_profiles:/app/chrome_profiles
+      - ./logs:/app/logs
+    shm_size: "1gb"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - scraply
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
+    container_name: scraply-frontend
+    ports:
+      - "127.0.0.1:3000:80"
+    depends_on:
+      - backend
+    networks:
+      - scraply
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    container_name: scraply-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-automation_db}
+      POSTGRES_USER: ${POSTGRES_USER:-automation_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-in-prod}
+    volumes:
+      - scraply-postgres-data:/var/lib/postgresql/data
+    networks:
+      - scraply
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-automation_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: scraply-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - scraply-redis-data:/data
+    networks:
+      - scraply
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  scraply-postgres-data:
+  scraply-redis-data:
+
+networks:
+  scraply:
+    driver: bridge
