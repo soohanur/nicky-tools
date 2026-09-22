@@ -47,12 +47,19 @@ def main() -> int:
     p.add_argument('--name-prefix', default='',
                    help="optional column with the Dutch name particle (e.g. 'voorvoegsel'); "
                         "composed as '<prefix> <company>' before searching")
+    p.add_argument('--postcode', default='',
+                   help="owner postcode column - the tightest address key company.info has")
     p.add_argument('--alt-street', default='', help='optional secondary address column (e.g. parcel street)')
     p.add_argument('--alt-house', default='')
     p.add_argument('--alt-city', default='')
+    p.add_argument('--alt-postcode', default='')
     p.add_argument('--sheet', default=None)
+    p.add_argument('--header-row', type=int, default=1,
+                   help='row holding the column names (2 when a group-label row sits above it)')
     p.add_argument('--out', default=None)
-    p.add_argument('--workers', type=int, default=2)
+    # One worker: two headless Chromes ran out of memory around row 180 and the
+    # run stopped silently with a partial file.
+    p.add_argument('--workers', type=int, default=1)
     p.add_argument('--limit', type=int, default=0, help='process only the first N non-blank rows')
     p.add_argument('--max-candidates', type=int, default=4)
     p.add_argument('--min-delay', type=float, default=2.0)
@@ -69,12 +76,12 @@ def main() -> int:
         return 2
 
     src = Path(args.input)
-    tf = TabularFile(src, sheet=args.sheet)
+    tf = TabularFile(src, sheet=args.sheet, header_row=args.header_row)
     rows = tf.read_rows()
 
     wanted = [args.company, args.street, args.house, args.city,
-              args.first_names, args.name_prefix,
-              args.alt_street, args.alt_house, args.alt_city]
+              args.first_names, args.name_prefix, args.postcode,
+              args.alt_street, args.alt_house, args.alt_city, args.alt_postcode]
     missing = [c for c in wanted if c and c not in tf.headers]
     if missing:
         print(f'ERROR: column(s) not in file: {missing}')
@@ -92,8 +99,9 @@ def main() -> int:
     fields = {'company': args.company, 'street': args.street,
               'house_number': args.house, 'city': args.city,
               'first_names': args.first_names, 'name_prefix': args.name_prefix,
+              'postcode': args.postcode,
               'alt_street': args.alt_street, 'alt_house': args.alt_house,
-              'alt_city': args.alt_city}
+              'alt_city': args.alt_city, 'alt_postcode': args.alt_postcode}
     store = ResultStore()
     cancel = Event()
 

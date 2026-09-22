@@ -196,11 +196,13 @@ def process_rows(
             first = col('first_names')
             street, house, city = col('street'), col('house_number'), col('city')
 
+            postcode = col('postcode')
             alt = []
             alt_street, alt_house, alt_city = (col('alt_street'), col('alt_house'),
                                                col('alt_city'))
+            alt_post = col('alt_postcode')
             if alt_street and (alt_street, alt_house) != (street, house):
-                alt.append((alt_street, alt_house, alt_city or city))
+                alt.append((alt_street, alt_house, alt_city or city, alt_post))
 
             if not lead and not street and not alt:
                 store.put(row['row_index'],
@@ -211,7 +213,7 @@ def process_rows(
 
             try:
                 outcome = searcher.search(lead, first, street, house, city,
-                                          alt_addresses=alt)
+                                          postcode=postcode, alt_addresses=alt)
                 consecutive_errors = 0
                 block_hits = 0
             except BlockedError as be:

@@ -552,6 +552,25 @@ class VerifiedSearcher:
             return False
         return rx.search(self._page_text()) is not None
 
+    def _postcode_matches(self, postcode: str, house: str) -> bool:
+        """
+        Does the open page carry this postcode, with the house number next to it?
+
+        A postcode identifies a side of one street in one town, so postcode plus
+        house number is the strongest address evidence available here - far
+        stronger than a street name, which repeats across the country.
+        """
+        pc = re.sub(r'\s+', '', (postcode or '')).upper()
+        if not re.fullmatch(r'\d{4}[A-Z]{2}', pc):
+            return False
+        text = self._page_text().upper()
+        loose = pc[:4] + r'\s*' + pc[4:]
+        if not re.search(loose, text):
+            return False
+        if not house:
+            return True
+        return re.search(r'\b' + re.escape(str(house).strip()) + r'\b', text) is not None
+
     def _ownership(
         self,
         strong: List[str],
@@ -590,7 +609,8 @@ class VerifiedSearcher:
         street: str = '',
         house: str = '',
         city: str = '',
-        alt_addresses: Optional[List[Tuple[str, str, str]]] = None,
+        postcode: str = '',
+        alt_addresses: Optional[List[Tuple[str, ...]]] = None,
     ) -> SearchOutcome:
         """
         alt_addresses: extra (street, house, city) triples to try after the
@@ -697,16 +717,33 @@ class VerifiedSearcher:
         # Primary (registered) address first, then any alternates (parcel
         # address). Ownership is proved for every hit, so a wider address net
         # cannot introduce tenants - it only finds owners we would have missed.
-        triples = [(street, house, city)] + list(alt_addresses or [])
+        # Postcode FIRST. A Dutch postcode plus house number is the canonical
+        # unique address; street + city is not. Measured on Nieuwstad 12
+        # Groenlo: 'street house city' returns 3 companies and ranks a printing
+        # shop from another stretch of the same street first, while
+        # 'street house postcode' returns only the two entities actually at
+        # number 12. That one change removes the company that was written onto
+        # four parish rows.
+        triples = [(street, house, city, postcode)]
+        for extra in (alt_addresses or []):
+            st, hs, ct = (list(extra) + ['', '', ''])[:3]
+            pc = extra[3] if len(extra) > 3 else ''
+            triples.append((st, hs, ct, pc))
+
         queries, seen_q = [], set()
-        for st, hs, ct in triples:
-            for q in (' '.join(x for x in (st, hs, ct) if x),
-                      ' '.join(x for x in (st, hs) if x)):
+        for st, hs, ct, pc in triples:
+            forms = (
+                ' '.join(x for x in (st, hs, pc) if x),   # tightest
+                ' '.join(x for x in (pc, hs) if x),
+                ' '.join(x for x in (st, hs, ct) if x),
+                ' '.join(x for x in (st, hs) if x),       # loosest, still gated
+            )
+            for q in forms:
                 q = q.strip()
                 if q and q.lower() not in seen_q:
                     seen_q.add(q.lower())
-                    queries.append((q, st, hs))
-        for q, q_street, q_house in queries:
+                    queries.append((q, st, hs, pc))
+        for q, q_street, q_house, q_post in queries:
             try:
                 self.pause()
                 names = self._search(q)
@@ -721,7 +758,8 @@ class VerifiedSearcher:
                     # sit at the address we searched (dropping the city can
                     # return 25 unrelated hits), AND the owner must be named
                     # on its page.
-                    at_address = self._address_matches(q_street, q_house)
+                    at_address = (self._address_matches(q_street, q_house)
+                                  or self._postcode_matches(q_post, q_house))
                     owned, hits = self._ownership(strong, short, given)
                     if at_address and owned:
                         phones, mail = self._contacts()
